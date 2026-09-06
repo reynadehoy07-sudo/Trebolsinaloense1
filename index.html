@@ -1,0 +1,753 @@
+/**
+ * Andamiaje del backend (Node.js + Express + PostgreSQL) para la
+ * plataforma de rifas. Este archivo es un punto de partida: define las
+ * rutas principales y la lógica crítica de concurrencia al apartar
+ * boletos. No incluye configuración de despliegue ni variables de entorno.
+ *
+ * Instalar dependencias:
+ *   npm install express pg stripe cors dotenv
+ */
+
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+const Stripe = require("stripe");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY || "");
+
+// ---------- Rifas ----------
+
+// Listar rifas (público)
+app.get("/api/rifas", async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT r.*,
+       (SELECT COUNT(*) FROM boletos b WHERE b.rifa_id = r.id) AS boletos_apartados
+     FROM rifas r ORDER BY creado_en DESC`
+  );
+  res.json(rows);
+});
+
+// Crear rifa (admin)
+app.post("/api/admin/rifas", async (req, res) => {
+  const { nombre, descripcion, imagen_url, precio_boleto, total_boletos, fecha_sorteo } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO rifas (nombre, descripcion, imagen_url, precio_boleto, total_boletos, fecha_sorteo)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [nombre, descripcion, imagen_url, precio_boleto, total_boletos, fecha_sorteo]
+  );
+  res.status(201).json(rows[0]);
+});
+
+// Editar / cerrar rifa (admin)
+app.patch("/api/admin/rifas/:id", async (req, res) => {
+  const { id } = req.params;
+  const campos = req.body;
+  const sets = Object.keys(campos).map((k, i) => `${k} = $${i + 2}`).join(", ");
+  const { rows } = await pool.query(
+    `UPDATE rifas SET ${sets} WHERE id = $1 RETURNING *`,
+    [id, ...Object.values(campos)]
+  );
+  res.json(rows[0]);
+});
+
+// Estado de boletos de una rifa (público, para pintar el grid)
+app.get("/api/rifas/:id/boletos", async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT numero, estado FROM boletos WHERE rifa_id = $1`,
+    [req.params.id]
+  );
+  res.json(rows);
+});
+
+// ---------- Apartar boletos (elegidos o aleatorios) ----------
+// Punto crítico: dos compradores no pueden quedarse con el mismo número.
+// Se apoya en la restricción UNIQUE (rifa_id, numero) de la base de datos.
+
+app.post("/api/rifas/:id/apartar", async (req, res) => {
+  const rifaId = req.params.id;
+  const { numeros, aleatorios, comprador } = req.body; // numeros: [3,17,102] | aleatorios: 5
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const { rows: rifaRows } = await client.query("SELECT * FROM rifas WHERE id = $1 FOR UPDATE", [rifaId]);
+    const rifa = rifaRows[0];
+    if (!rifa || rifa.estado !== "activa") throw new Error("Rifa no disponible");
+
+    let numerosAApartar = numeros || [];
+
+    if (aleatorios) {
+      const { rows: ocupados } = await client.query("SELECT numero FROM boletos WHERE rifa_id = $1", [rifaId]);
+      const ocupadosSet = new Set(ocupados.map((o) => o.numero));
+      const disponibles = [];
+      for (let n = 0; n < rifa.total_boletos; n++) if (!ocupadosSet.has(n)) disponibles.push(n);
+      // baraja simple y toma los primeros N
+      for (let i = disponibles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [disponibles[i], disponibles[j]] = [disponibles[j], disponibles[i]];
+      }
+      numerosAApartar = disponibles.slice(0, aleatorios);
+    }
+
+    const insertados = [];
+    for (const numero of numerosAApartar) {
+      // Si el número ya fue tomado por otra transacción, esto lanza error
+      // de UNIQUE y se detiene toda la operación (rollback).
+      const { rows } = await client.query(
+        `INSERT INTO boletos (rifa_id, numero, estado, comprador_nombre, comprador_telefono, comprador_email)
+         VALUES ($1,$2,'apartado',$3,$4,$5) RETURNING *`,
+        [rifaId, numero, comprador?.nombre, comprador?.telefono, comprador?.email]
+      );
+      insertados.push(rows[0]);
+    }
+
+    await client.query("COMMIT");
+    res.status(201).json({ boletos: insertados });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(409).json({ error: err.message || "No se pudieron apartar los boletos, intenta de nuevo." });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------- Pago con tarjeta (Stripe) ----------
+
+app.post("/api/pagos/crear-intento", async (req, res) => {
+  const { monto, rifaId, boletoIds } = req.body;
+  const intento = await stripe.paymentIntents.create({
+    amount: Math.round(monto * 100), // centavos
+    currency: "mxn",
+    metadata: { rifaId, boletoIds: boletoIds.join(",") },
+  });
+  res.json({ clientSecret: intento.client_secret });
+});
+
+// Webhook de Stripe: confirma el pago cuando el banco lo aprueba
+app.post("/api/pagos/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const evento = req.body; // en producción: verificar firma con stripe.webhooks.constructEvent
+  if (evento.type === "payment_intent.succeeded") {
+    const { boletoIds } = evento.data.object.metadata;
+    await pool.query(
+      `UPDATE boletos SET estado = 'pagado', pagado_en = now(), metodo_pago = 'tarjeta',
+         stripe_payment_intent_id = $1 WHERE id = ANY($2::uuid[])`,
+      [evento.data.object.id, boletoIds.split(",")]
+    );
+  }
+  res.json({ received: true });
+});
+
+// ---------- Confirmar pago manual (transferencia/SPEI) — panel admin ----------
+
+app.post("/api/admin/boletos/:id/confirmar-pago", async (req, res) => {
+  await pool.query(
+    `UPDATE boletos SET estado = 'pagado', pagado_en = now(), metodo_pago = 'transferencia' WHERE id = $1`,
+    [req.params.id]
+  );
+  res.json({ ok: true });
+});
+
+// Liberar un boleto apartado que nunca se pagó
+app.delete("/api/admin/boletos/:id", async (req, res) => {
+  await pool.query("DELETE FROM boletos WHERE id = $1", [req.params.id]);
+  res.json({ ok: true });
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`API escuchando en puerto ${PORT}`));
+
+import React, { useState, useEffect, useMemo } from "react";
+import { Plus, Trash2, Pencil, X, Ticket, DollarSign, Users, CheckCircle2, Clock, Search, ChevronLeft } from "lucide-react";
+
+// ---------- Persistencia ----------
+const STORAGE_KEY = "rifas:list";
+
+const seed = [
+  {
+    id: "r1",
+    nombre: "Camioneta RAM 2025 0km",
+    descripcion: "Rifa a beneficio de la comunidad. Incluye seguro del primer año.",
+    imagen: "https://images.unsplash.com/photo-1591768793355-74d04bb6608f?w=600&q=80",
+    precioBoleto: 250,
+    totalBoletos: 500,
+    fechaSorteo: "2026-12-15",
+    estado: "activa",
+    boletos: {}, // { "0007": { estado: "pagado"|"apartado", comprador, metodo } }
+  },
+  {
+    id: "r2",
+    nombre: "MacBook Pro 16\" + iPhone 16",
+    descripcion: "Combo tecnológico, sorteo en vivo por redes sociales.",
+    imagen: "https://images.unsplash.com/photo-1517336714731-489689fd1ca8?w=600&q=80",
+    precioBoleto: 100,
+    totalBoletos: 300,
+    fechaSorteo: "2026-11-01",
+    estado: "activa",
+    boletos: {},
+  },
+];
+
+function pad(n, len) {
+  return String(n).padStart(len, "0");
+}
+
+function ticketDigits(total) {
+  return String(total - 1).length;
+}
+
+export default function App() {
+  const [rifas, setRifas] = useState(null);
+  const [vista, setVista] = useState({ tipo: "lista" }); // lista | crear | editar | detalle
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY);
+        setRifas(res ? JSON.parse(res.value) : seed);
+      } catch {
+        setRifas(seed);
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    window.storage.set(STORAGE_KEY, JSON.stringify(rifas)).catch(() => {});
+  }, [rifas, loaded]);
+
+  if (!loaded) {
+    return (
+      <div style={styles.loadingWrap}>
+        <div style={styles.loadingText}>Cargando panel…</div>
+      </div>
+    );
+  }
+
+  const rifaActiva = vista.id ? rifas.find((r) => r.id === vista.id) : null;
+
+  function guardarRifa(datos, idEditar) {
+    if (idEditar) {
+      setRifas((prev) => prev.map((r) => (r.id === idEditar ? { ...r, ...datos } : r)));
+    } else {
+      const nueva = { id: "r" + Date.now(), boletos: {}, estado: "activa", ...datos };
+      setRifas((prev) => [nueva, ...prev]);
+    }
+    setVista({ tipo: "lista" });
+  }
+
+  function eliminarRifa(id) {
+    setRifas((prev) => prev.filter((r) => r.id !== id));
+    setVista({ tipo: "lista" });
+  }
+
+  function actualizarBoleto(rifaId, numero, data) {
+    setRifas((prev) =>
+      prev.map((r) => {
+        if (r.id !== rifaId) return r;
+        const boletos = { ...r.boletos };
+        if (data === null) {
+          delete boletos[numero];
+        } else {
+          boletos[numero] = { ...boletos[numero], ...data };
+        }
+        return { ...r, boletos };
+      })
+    );
+  }
+
+  return (
+    <div style={styles.app}>
+      <style>{fontImport}</style>
+      <Sidebar vista={vista} setVista={setVista} />
+      <main style={styles.main}>
+        {vista.tipo === "lista" && (
+          <ListaRifas rifas={rifas} setVista={setVista} />
+        )}
+        {(vista.tipo === "crear" || vista.tipo === "editar") && (
+          <FormularioRifa
+            rifa={vista.tipo === "editar" ? rifaActiva : null}
+            onGuardar={(d) => guardarRifa(d, vista.tipo === "editar" ? vista.id : null)}
+            onCancelar={() => setVista({ tipo: "lista" })}
+            onEliminar={vista.tipo === "editar" ? () => eliminarRifa(vista.id) : null}
+          />
+        )}
+        {vista.tipo === "detalle" && rifaActiva && (
+          <DetalleRifa
+            rifa={rifaActiva}
+            onVolver={() => setVista({ tipo: "lista" })}
+            onEditar={() => setVista({ tipo: "editar", id: rifaActiva.id })}
+            onActualizarBoleto={(numero, data) => actualizarBoleto(rifaActiva.id, numero, data)}
+          />
+        )}
+      </main>
+    </div>
+  );
+}
+
+// ---------- Sidebar ----------
+function Sidebar({ vista, setVista }) {
+  return (
+    <aside style={styles.sidebar}>
+      <div style={styles.brand}>
+        <div style={styles.brandMark}>🍀</div>
+        <div>
+          <div style={styles.brandName}>Panel de Rifas</div>
+          <div style={styles.brandSub}>Administración</div>
+        </div>
+      </div>
+      <nav style={styles.nav}>
+        <button
+          style={{ ...styles.navItem, ...(vista.tipo !== "crear" && vista.tipo !== "editar" ? styles.navItemActive : {}) }}
+          onClick={() => setVista({ tipo: "lista" })}
+        >
+          <Ticket size={17} /> Rifas
+        </button>
+        <button style={styles.navItem} onClick={() => setVista({ tipo: "crear" })}>
+          <Plus size={17} /> Nueva rifa
+        </button>
+      </nav>
+      <div style={styles.sidebarFooter}>Trébol Sonorense A.C.</div>
+    </aside>
+  );
+}
+
+// ---------- Lista de rifas ----------
+function ListaRifas({ rifas, setVista }) {
+  const totalIngresos = useMemo(
+    () =>
+      rifas.reduce((acc, r) => {
+        const pagados = Object.values(r.boletos).filter((b) => b.estado === "pagado").length;
+        return acc + pagados * r.precioBoleto;
+      }, 0),
+    [rifas]
+  );
+  const totalVendidos = rifas.reduce((acc, r) => acc + Object.keys(r.boletos).length, 0);
+
+  return (
+    <div>
+      <header style={styles.header}>
+        <div>
+          <h1 style={styles.h1}>Tus rifas</h1>
+          <p style={styles.sub}>Crea, edita y da seguimiento a cada sorteo.</p>
+        </div>
+        <button style={styles.btnPrimary} onClick={() => setVista({ tipo: "crear" })}>
+          <Plus size={16} /> Nueva rifa
+        </button>
+      </header>
+
+      <div style={styles.statsRow}>
+        <StatCard icon={<Ticket size={18} />} label="Rifas activas" value={rifas.filter((r) => r.estado === "activa").length} />
+        <StatCard icon={<Users size={18} />} label="Boletos con movimiento" value={totalVendidos} />
+        <StatCard icon={<DollarSign size={18} />} label="Ingresos confirmados" value={`$${totalIngresos.toLocaleString("es-MX")}`} />
+      </div>
+
+      <div style={styles.grid}>
+        {rifas.map((r) => {
+          const vendidos = Object.keys(r.boletos).length;
+          const pagados = Object.values(r.boletos).filter((b) => b.estado === "pagado").length;
+          const pct = Math.round((vendidos / r.totalBoletos) * 100);
+          return (
+            <div key={r.id} style={styles.card} onClick={() => setVista({ tipo: "detalle", id: r.id })}>
+              <div style={{ ...styles.cardImg, backgroundImage: `url(${r.imagen})` }}>
+                <span style={{ ...styles.badge, ...(r.estado === "activa" ? styles.badgeActive : styles.badgeClosed) }}>
+                  {r.estado === "activa" ? "Activa" : "Cerrada"}
+                </span>
+              </div>
+              <div style={styles.cardBody}>
+                <div style={styles.cardTitle}>{r.nombre}</div>
+                <div style={styles.cardMeta}>
+                  ${r.precioBoleto} MXN · {r.totalBoletos} boletos · Sorteo {formatFecha(r.fechaSorteo)}
+                </div>
+                <div style={styles.progressTrack}>
+                  <div style={{ ...styles.progressFill, width: `${pct}%` }} />
+                </div>
+                <div style={styles.cardFoot}>
+                  <span>{vendidos}/{r.totalBoletos} apartados</span>
+                  <span>{pagados} pagados</span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {rifas.length === 0 && (
+          <div style={styles.empty}>Aún no hay rifas. Crea la primera para empezar a vender boletos.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ icon, label, value }) {
+  return (
+    <div style={styles.statCard}>
+      <div style={styles.statIcon}>{icon}</div>
+      <div>
+        <div style={styles.statValue}>{value}</div>
+        <div style={styles.statLabel}>{label}</div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Formulario crear/editar ----------
+function FormularioRifa({ rifa, onGuardar, onCancelar, onEliminar }) {
+  const [nombre, setNombre] = useState(rifa?.nombre || "");
+  const [descripcion, setDescripcion] = useState(rifa?.descripcion || "");
+  const [imagen, setImagen] = useState(rifa?.imagen || "");
+  const [precioBoleto, setPrecioBoleto] = useState(rifa?.precioBoleto || "");
+  const [totalBoletos, setTotalBoletos] = useState(rifa?.totalBoletos || "");
+  const [fechaSorteo, setFechaSorteo] = useState(rifa?.fechaSorteo || "");
+  const [estado, setEstado] = useState(rifa?.estado || "activa");
+
+  function submit(e) {
+    e.preventDefault();
+    if (!nombre || !precioBoleto || !totalBoletos || !fechaSorteo) return;
+    onGuardar({
+      nombre,
+      descripcion,
+      imagen: imagen || "https://images.unsplash.com/photo-1607344645866-009c320c5ab8?w=600&q=80",
+      precioBoleto: Number(precioBoleto),
+      totalBoletos: Number(totalBoletos),
+      fechaSorteo,
+      estado,
+    });
+  }
+
+  return (
+    <div style={styles.formWrap}>
+      <button style={styles.backLink} onClick={onCancelar}>
+        <ChevronLeft size={16} /> Volver
+      </button>
+      <h1 style={styles.h1}>{rifa ? "Editar rifa" : "Nueva rifa"}</h1>
+      <form onSubmit={submit} style={styles.form}>
+        <Field label="Nombre del premio">
+          <input style={styles.input} value={nombre} onChange={(e) => setNombre(e.target.value)} placeholder="Ej. Camioneta RAM 2025" />
+        </Field>
+        <Field label="Descripción">
+          <textarea style={{ ...styles.input, minHeight: 80, resize: "vertical" }} value={descripcion} onChange={(e) => setDescripcion(e.target.value)} placeholder="Detalles del premio, condiciones del sorteo…" />
+        </Field>
+        <Field label="URL de imagen">
+          <input style={styles.input} value={imagen} onChange={(e) => setImagen(e.target.value)} placeholder="https://…" />
+        </Field>
+        <div style={styles.formRow}>
+          <Field label="Precio por boleto (MXN)">
+            <input style={styles.input} type="number" min="1" value={precioBoleto} onChange={(e) => setPrecioBoleto(e.target.value)} placeholder="250" />
+          </Field>
+          <Field label="Total de boletos">
+            <input style={styles.input} type="number" min="1" value={totalBoletos} onChange={(e) => setTotalBoletos(e.target.value)} placeholder="500" />
+          </Field>
+        </div>
+        <div style={styles.formRow}>
+          <Field label="Fecha del sorteo">
+            <input style={styles.input} type="date" value={fechaSorteo} onChange={(e) => setFechaSorteo(e.target.value)} />
+          </Field>
+          <Field label="Estado">
+            <select style={styles.input} value={estado} onChange={(e) => setEstado(e.target.value)}>
+              <option value="activa">Activa</option>
+              <option value="cerrada">Cerrada</option>
+            </select>
+          </Field>
+        </div>
+        <div style={styles.formActions}>
+          {onEliminar && (
+            <button type="button" style={styles.btnDanger} onClick={onEliminar}>
+              <Trash2 size={15} /> Eliminar rifa
+            </button>
+          )}
+          <div style={{ flex: 1 }} />
+          <button type="button" style={styles.btnGhost} onClick={onCancelar}>Cancelar</button>
+          <button type="submit" style={styles.btnPrimary}>Guardar rifa</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label style={styles.field}>
+      <span style={styles.fieldLabel}>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+// ---------- Detalle de rifa: grid de boletos ----------
+function DetalleRifa({ rifa, onVolver, onEditar, onActualizarBoleto }) {
+  const [busqueda, setBusqueda] = useState("");
+  const [seleccionado, setSeleccionado] = useState(null);
+
+  const digits = ticketDigits(rifa.totalBoletos);
+  const numeros = useMemo(() => {
+    const arr = [];
+    for (let i = 0; i < rifa.totalBoletos; i++) arr.push(pad(i, digits));
+    return busqueda ? arr.filter((n) => n.includes(busqueda)) : arr;
+  }, [rifa.totalBoletos, digits, busqueda]);
+
+  const vendidos = Object.keys(rifa.boletos).length;
+  const pagados = Object.values(rifa.boletos).filter((b) => b.estado === "pagado").length;
+  const apartados = vendidos - pagados;
+  const ingresos = pagados * rifa.precioBoleto;
+
+  return (
+    <div>
+      <button style={styles.backLink} onClick={onVolver}>
+        <ChevronLeft size={16} /> Todas las rifas
+      </button>
+
+      <header style={styles.header}>
+        <div>
+          <h1 style={styles.h1}>{rifa.nombre}</h1>
+          <p style={styles.sub}>Sorteo el {formatFecha(rifa.fechaSorteo)} · ${rifa.precioBoleto} MXN por boleto</p>
+        </div>
+        <button style={styles.btnGhost} onClick={onEditar}>
+          <Pencil size={15} /> Editar rifa
+        </button>
+      </header>
+
+      <div style={styles.statsRow}>
+        <StatCard icon={<Ticket size={18} />} label="Disponibles" value={rifa.totalBoletos - vendidos} />
+        <StatCard icon={<Clock size={18} />} label="Apartados" value={apartados} />
+        <StatCard icon={<CheckCircle2 size={18} />} label="Pagados" value={pagados} />
+        <StatCard icon={<DollarSign size={18} />} label="Ingresos confirmados" value={`$${ingresos.toLocaleString("es-MX")}`} />
+      </div>
+
+      <div style={styles.searchBar}>
+        <Search size={15} color="#7A8C7F" />
+        <input
+          style={styles.searchInput}
+          placeholder="Buscar número de boleto…"
+          value={busqueda}
+          onChange={(e) => setBusqueda(e.target.value.replace(/\D/g, ""))}
+        />
+      </div>
+
+      <div style={styles.legend}>
+        <LegendItem color={COLORS.disponible} label="Disponible" />
+        <LegendItem color={COLORS.apartado} label="Apartado" />
+        <LegendItem color={COLORS.pagado} label="Pagado" />
+      </div>
+
+      <div style={styles.ticketGrid}>
+        {numeros.map((n) => {
+          const b = rifa.boletos[n];
+          const estado = b?.estado || "disponible";
+          return (
+            <button
+              key={n}
+              style={{
+                ...styles.ticketCell,
+                background: estado === "pagado" ? COLORS.pagado : estado === "apartado" ? COLORS.apartado : COLORS.disponible,
+                color: estado === "disponible" ? "#2B3A2E" : "#fff",
+              }}
+              onClick={() => setSeleccionado(n)}
+            >
+              {n}
+            </button>
+          );
+        })}
+      </div>
+
+      {seleccionado && (
+        <BoletoModal
+          numero={seleccionado}
+          data={rifa.boletos[seleccionado]}
+          onCerrar={() => setSeleccionado(null)}
+          onActualizar={(data) => {
+            onActualizarBoleto(seleccionado, data);
+            setSeleccionado(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function LegendItem({ color, label }) {
+  return (
+    <div style={styles.legendItem}>
+      <span style={{ ...styles.legendDot, background: color }} />
+      {label}
+    </div>
+  );
+}
+
+function BoletoModal({ numero, data, onCerrar, onActualizar }) {
+  const [comprador, setComprador] = useState(data?.comprador || "");
+  const [metodo, setMetodo] = useState(data?.metodo || "transferencia");
+
+  return (
+    <div style={styles.modalOverlay} onClick={onCerrar}>
+      <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span style={styles.modalTitle}>Boleto #{numero}</span>
+          <button style={styles.iconBtn} onClick={onCerrar}><X size={16} /></button>
+        </div>
+        <Field label="Comprador">
+          <input style={styles.input} value={comprador} onChange={(e) => setComprador(e.target.value)} placeholder="Nombre del comprador" />
+        </Field>
+        <Field label="Método de pago">
+          <select style={styles.input} value={metodo} onChange={(e) => setMetodo(e.target.value)}>
+            <option value="transferencia">Transferencia / SPEI</option>
+            <option value="tarjeta">Tarjeta (Stripe)</option>
+          </select>
+        </Field>
+        <div style={styles.modalActions}>
+          {data && (
+            <button style={styles.btnDanger} onClick={() => onActualizar(null)}>
+              <Trash2 size={14} /> Liberar boleto
+            </button>
+          )}
+          <div style={{ flex: 1 }} />
+          <button style={styles.btnGhost} onClick={() => onActualizar({ estado: "apartado", comprador, metodo })}>
+            Marcar apartado
+          </button>
+          <button style={styles.btnPrimary} onClick={() => onActualizar({ estado: "pagado", comprador, metodo })}>
+            Confirmar pago
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatFecha(f) {
+  if (!f) return "";
+  const d = new Date(f + "T00:00:00");
+  return d.toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" });
+}
+
+// ---------- Tokens de diseño ----------
+const COLORS = {
+  bg: "#F6F4EC",
+  panel: "#FFFFFF",
+  ink: "#20301F",
+  inkSoft: "#5A6B57",
+  clover: "#1F4A34",
+  cloverDark: "#163826",
+  gold: "#C9A227",
+  border: "#E3E0D2",
+  disponible: "#EDEAE0",
+  apartado: "#C9A227",
+  pagado: "#1F4A34",
+};
+
+const fontImport = `
+  @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Inter:wght@400;500;600&display=swap');
+`;
+
+const styles = {
+  app: { display: "flex", minHeight: "100vh", background: COLORS.bg, fontFamily: "'Inter', sans-serif", color: COLORS.ink },
+  loadingWrap: { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: COLORS.bg, fontFamily: "'Inter', sans-serif" },
+  loadingText: { color: COLORS.inkSoft },
+  sidebar: { width: 220, background: COLORS.cloverDark, color: "#F6F4EC", display: "flex", flexDirection: "column", padding: "24px 16px", flexShrink: 0 },
+  brand: { display: "flex", alignItems: "center", gap: 10, marginBottom: 32, padding: "0 8px" },
+  brandMark: { fontSize: 22 },
+  brandName: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 },
+  brandSub: { fontSize: 11, opacity: 0.65 },
+  nav: { display: "flex", flexDirection: "column", gap: 4 },
+  navItem: { display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 8, border: "none", background: "transparent", color: "#E8E6D8", fontSize: 14, cursor: "pointer", textAlign: "left" },
+  navItemActive: { background: "rgba(246,244,236,0.12)" },
+  sidebarFooter: { marginTop: "auto", fontSize: 11, opacity: 0.5, padding: "0 8px" },
+  main: { flex: 1, padding: "36px 44px", maxWidth: 1100 },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 28, gap: 16, flexWrap: "wrap" },
+  h1: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 28, margin: 0, color: COLORS.clover },
+  sub: { color: COLORS.inkSoft, fontSize: 14, margin: "6px 0 0" },
+  statsRow: { display: "flex", gap: 14, marginBottom: 28, flexWrap: "wrap" },
+  statCard: { display: "flex", alignItems: "center", gap: 12, background: COLORS.panel, border: `1px solid ${COLORS.border}`, borderRadius: 10, padding: "14px 18px", minWidth: 160 },
+  statIcon: { color: COLORS.gold },
+  statValue: { fontFamily: "'Fraunces', serif", fontSize: 20, fontWeight: 600, lineHeight: 1 },
+  statLabel: { fontSize: 12, color: COLORS.inkSoft, marginTop: 3 },
+  grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 18 },
+  card: { background: COLORS.panel, border: `1px solid ${COLORS.border}`, borderRadius: 12, overflow: "hidden", cursor: "pointer" },
+  cardImg: { height: 130, backgroundSize: "cover", backgroundPosition: "center", position: "relative" },
+  badge: { position: "absolute", top: 10, right: 10, fontSize: 11, padding: "3px 9px", borderRadius: 20, fontWeight: 600 },
+  badgeActive: { background: COLORS.gold, color: "#2B2000" },
+  badgeClosed: { background: "#C9C4AE", color: "#3A3A2E" },
+  cardBody: { padding: 16 },
+  cardTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16, marginBottom: 4 },
+  cardMeta: { fontSize: 12.5, color: COLORS.inkSoft, marginBottom: 10 },
+  progressTrack: { height: 6, background: COLORS.disponible, borderRadius: 4, overflow: "hidden" },
+  progressFill: { height: "100%", background: COLORS.clover },
+  cardFoot: { display: "flex", justifyContent: "space-between", fontSize: 12, color: COLORS.inkSoft, marginTop: 8 },
+  empty: { color: COLORS.inkSoft, fontSize: 14, padding: 20 },
+  formWrap: { maxWidth: 560 },
+  form: { display: "flex", flexDirection: "column", gap: 16, marginTop: 20 },
+  formRow: { display: "flex", gap: 14 },
+  field: { display: "flex", flexDirection: "column", gap: 6, flex: 1 },
+  fieldLabel: { fontSize: 12.5, color: COLORS.inkSoft, fontWeight: 500 },
+  input: { border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: "10px 12px", fontSize: 14, fontFamily: "'Inter', sans-serif", background: COLORS.panel, color: COLORS.ink, outline: "none" },
+  formActions: { display: "flex", alignItems: "center", gap: 10, marginTop: 10 },
+  btnPrimary: { display: "flex", alignItems: "center", gap: 6, background: COLORS.clover, color: "#fff", border: "none", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" },
+  btnGhost: { display: "flex", alignItems: "center", gap: 6, background: "transparent", color: COLORS.clover, border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 500, cursor: "pointer" },
+  btnDanger: { display: "flex", alignItems: "center", gap: 6, background: "transparent", color: "#9B3B2C", border: "1px solid #E3C6BE", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 500, cursor: "pointer" },
+  backLink: { display: "flex", alignItems: "center", gap: 4, background: "transparent", border: "none", color: COLORS.inkSoft, fontSize: 13, cursor: "pointer", padding: 0, marginBottom: 18 },
+  searchBar: { display: "flex", alignItems: "center", gap: 8, background: COLORS.panel, border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: "8px 12px", maxWidth: 280, marginBottom: 14 },
+  searchInput: { border: "none", outline: "none", fontSize: 13, flex: 1, background: "transparent" },
+  legend: { display: "flex", gap: 16, marginBottom: 14 },
+  legendItem: { display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: COLORS.inkSoft },
+  legendDot: { width: 10, height: 10, borderRadius: 3, display: "inline-block" },
+  ticketGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(52px, 1fr))", gap: 6 },
+  ticketCell: { border: "none", borderRadius: 6, padding: "8px 0", fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: "'Inter', sans-serif" },
+  modalOverlay: { position: "fixed", inset: 0, background: "rgba(20,26,18,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50 },
+  modal: { background: COLORS.panel, borderRadius: 12, padding: 22, width: 340, display: "flex", flexDirection: "column", gap: 14 },
+  modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center" },
+  modalTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16 },
+  iconBtn: { background: "transparent", border: "none", cursor: "pointer", color: COLORS.inkSoft },
+  modalActions: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
+};
+
+-- Esquema base para la plataforma de rifas
+-- PostgreSQL
+
+CREATE TABLE rifas (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nombre        TEXT NOT NULL,
+  descripcion   TEXT,
+  imagen_url    TEXT,
+  precio_boleto NUMERIC(10,2) NOT NULL CHECK (precio_boleto > 0),
+  total_boletos INTEGER NOT NULL CHECK (total_boletos > 0),
+  fecha_sorteo  DATE NOT NULL,
+  estado        TEXT NOT NULL DEFAULT 'activa' CHECK (estado IN ('activa', 'cerrada')),
+  creado_en     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE boletos (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  rifa_id      UUID NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+  numero       INTEGER NOT NULL,
+  estado       TEXT NOT NULL DEFAULT 'apartado' CHECK (estado IN ('apartado', 'pagado')),
+  comprador_nombre TEXT,
+  comprador_telefono TEXT,
+  comprador_email TEXT,
+  metodo_pago  TEXT CHECK (metodo_pago IN ('tarjeta', 'transferencia')),
+  stripe_payment_intent_id TEXT,
+  reservado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+  pagado_en    TIMESTAMPTZ,
+  -- Un mismo número no puede apartarse dos veces en la misma rifa:
+  UNIQUE (rifa_id, numero)
+);
+
+CREATE TABLE ganadores (
+  id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  rifa_id   UUID NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+  boleto_id UUID NOT NULL REFERENCES boletos(id),
+  elegido_en TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_boletos_rifa ON boletos(rifa_id);
+CREATE INDEX idx_boletos_estado ON boletos(rifa_id, estado);
+
+-- Nota importante: para "apartar" un boleto (elegido o aleatorio) sin que dos
+-- compradores se queden con el mismo número al mismo tiempo, la inserción en
+-- `boletos` debe hacerse dentro de una transacción con manejo del error de
+-- UNIQUE (rifa_id, numero) — así el segundo intento simplemente falla y el
+-- backend le ofrece otro número al comprador.
